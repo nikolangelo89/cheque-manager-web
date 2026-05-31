@@ -1,6 +1,6 @@
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from urllib.parse import urlparse
+import pg8000
 from flask import Flask, render_template_string, request, redirect, url_for
 
 app = Flask(__name__)
@@ -9,7 +9,32 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
 def get_connection():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+
+    parsed = urlparse(DATABASE_URL)
+    user = parsed.username
+    password = parsed.password
+    database = parsed.path.lstrip("/")  # "/railway" -> "railway"
+    host = parsed.hostname
+    port = parsed.port or 5432
+
+    return pg8000.connect(
+        user=user,
+        password=password,
+        host=host,
+        port=port,
+        database=database,
+    )
+
+
+def fetch_all_dicts(cur):
+    rows = cur.fetchall()
+    cols = [desc[0] for desc in cur.description]
+    result = []
+    for row in rows:
+        result.append({cols[i]: row[i] for i in range(len(cols))})
+    return result
 
 
 def init_db():
@@ -96,7 +121,7 @@ def list_suppliers():
         ORDER BY id;
         """
     )
-    suppliers = cur.fetchall()
+    suppliers = fetch_all_dicts(cur)
     cur.close()
     conn.close()
 
@@ -168,7 +193,7 @@ def list_cheques():
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT id, name FROM suppliers ORDER BY name;")
-    suppliers = cur.fetchall()
+    suppliers = fetch_all_dicts(cur)
 
     cur.execute(
         """
@@ -187,7 +212,7 @@ def list_cheques():
         ORDER BY c.due_date, c.id;
         """
     )
-    cheques = cur.fetchall()
+    cheques = fetch_all_dicts(cur)
     cur.close()
     conn.close()
 
@@ -245,5 +270,4 @@ def list_cheques():
 
 
 if __name__ == "__main__":
-    # Για τοπικό testing μόνο. Στο Railway τρέχει με gunicorn.
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
