@@ -1,14 +1,56 @@
 import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, request, redirect, url_for
 
 app = Flask(__name__)
 
-# Προσωρινά αποθηκεύουμε τα δεδομένα σε μνήμη για να δούμε τη ροή.
-# Αργότερα θα το κάνουμε με πραγματική βάση Postgres στο cloud.
-suppliers = []
-cheques = []
-supplier_id_counter = 1
-cheque_id_counter = 1
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+
+def get_connection():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
+def init_db():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS suppliers (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            balance NUMERIC(12,2) DEFAULT 0,
+            email TEXT,
+            phone TEXT
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cheques (
+            id SERIAL PRIMARY KEY,
+            pharmacy TEXT NOT NULL,
+            supplier_id INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
+            cheque_number TEXT,
+            amount NUMERIC(12,2) NOT NULL,
+            issue_date DATE,
+            due_date DATE NOT NULL,
+            employer_name TEXT,
+            status TEXT DEFAULT 'OPEN',
+            reminder_sent BOOLEAN DEFAULT FALSE
+        );
+        """
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+init_db()
 
 
 @app.route("/")
@@ -18,8 +60,6 @@ def index():
 
 @app.route("/suppliers", methods=["GET", "POST"])
 def list_suppliers():
-    global supplier_id_counter
-
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         balance = request.form.get("balance", "").strip()
@@ -32,16 +72,33 @@ def list_suppliers():
             except ValueError:
                 balance_val = 0.0
 
-            suppliers.append({
-                "id": supplier_id_counter,
-                "name": name,
-                "balance": balance_val,
-                "email": email,
-                "phone": phone,
-            })
-            supplier_id_counter += 1
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO suppliers (name, balance, email, phone)
+                VALUES (%s, %s, %s, %s);
+                """,
+                (name, balance_val, email, phone),
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
 
         return redirect(url_for("list_suppliers"))
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, name, balance, email, phone
+        FROM suppliers
+        ORDER BY id;
+        """
+    )
+    suppliers = cur.fetchall()
+    cur.close()
+    conn.close()
 
     html = """
     <h1>Προμηθευτές</h1>
@@ -61,9 +118,9 @@ def list_suppliers():
         <tr>
             <td>{{ s.id }}</td>
             <td>{{ s.name }}</td>
-            <td>{{ "%.2f"|format(s.balance) }}</td>
-            <td>{{ s.email }}</td>
-            <td>{{ s.phone }}</td>
+            <td>{{ "%.2f"|format(s.balance or 0) }}</td>
+            <td>{{ s.email or "" }}</td>
+            <td>{{ s.phone or "" }}</td>
         </tr>
         {% endfor %}
     </table>
@@ -71,10 +128,9 @@ def list_suppliers():
     """
     return render_template_string(html, suppliers=suppliers)
 
+
 @app.route("/cheques", methods=["GET", "POST"])
 def list_cheques():
-    global cheque_id_counter
-
     if request.method == "POST":
         pharmacy = request.form.get("pharmacy", "").strip()
         supplier_id = request.form.get("supplier_id", "").strip()
@@ -88,24 +144,52 @@ def list_cheques():
             try:
                 amount_val = float(amount)
             except ValueError:
-                amount_val = 0
+                amount_val = 0.0
 
-            cheques.append({
-                "id": cheque_id_counter,
-                "pharmacy": pharmacy,
-                "supplier_id": int(supplier_id),
-                "cheque_number": cheque_number,
-                "amount": amount_val,
-                "issue_date": issue_date,
-                "due_date": due_date,
-                "employer_name": employer_name,
-                "status": "OPEN",
-            })
-            cheque_id_counter += 1
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO cheques
+                    (pharmacy, supplier_id, cheque_number, amount,
+                     issue_date, due_date, employer_name, status)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, 'OPEN');
+                """,
+                (pharmacy, int(supplier_id), cheque_number, amount_val,
+                 issue_date or None, due_date, employer_name),
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
 
         return redirect(url_for("list_cheques"))
 
-    supplier_map = {s["id"]: s["name"] for s in suppliers}
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM suppliers ORDER BY name;")
+    suppliers = cur.fetchall()
+
+    cur.execute(
+        """
+        SELECT
+            c.id,
+            c.pharmacy,
+            c.cheque_number,
+            c.amount,
+            c.issue_date,
+            c.due_date,
+            c.employer_name,
+            c.status,
+            s.name AS supplier_name
+        FROM cheques c
+        LEFT JOIN suppliers s ON c.supplier_id = s.id
+        ORDER BY c.due_date, c.id;
+        """
+    )
+    cheques = cur.fetchall()
+    cur.close()
+    conn.close()
 
     html = """
     <h1>Επιταγές</h1>
@@ -145,21 +229,21 @@ def list_cheques():
         <tr>
             <td>{{ c.id }}</td>
             <td>{{ c.pharmacy }}</td>
-            <td>{{ supplier_map.get(c.supplier_id, '') }}</td>
-            <td>{{ c.cheque_number }}</td>
-            <td>{{ c.amount }}</td>
-            <td>{{ c.issue_date }}</td>
+            <td>{{ c.supplier_name or "" }}</td>
+            <td>{{ c.cheque_number or "" }}</td>
+            <td>{{ "%.2f"|format(c.amount or 0) }}</td>
+            <td>{{ c.issue_date or "" }}</td>
             <td>{{ c.due_date }}</td>
-            <td>{{ c.employer_name }}</td>
+            <td>{{ c.employer_name or "" }}</td>
             <td>{{ c.status }}</td>
         </tr>
         {% endfor %}
     </table>
     <p><a href="{{ url_for('list_suppliers') }}">Προμηθευτές</a></p>
     """
-    return render_template_string(html, suppliers=suppliers, cheques=cheques, supplier_map=supplier_map)
+    return render_template_string(html, suppliers=suppliers, cheques=cheques)
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    # Για τοπικό testing μόνο. Στο Railway τρέχει με gunicorn.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
